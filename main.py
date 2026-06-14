@@ -1,4 +1,5 @@
 import sys
+import os
 import uuid
 import json
 from fastapi import FastAPI
@@ -8,9 +9,11 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.stdio import stdio_client
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 
 load_dotenv()
 anthropic = Anthropic()
@@ -26,8 +29,14 @@ app.add_middleware(
 server_params = StdioServerParameters(
     command=sys.executable,
     args=["server.py"],
-    env=None,
+    env=os.environ,
 )
+
+# LiteLLM MCP server config
+LITELLM_URL = "https://litellm.tfscreener.com/mcp/"
+LITELLM_HEADERS = {
+    "Authorization": f"Bearer {os.getenv('LITELLM_API_KEY')}",
+}
 
 now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
@@ -65,92 +74,117 @@ class ChatRequest(BaseModel):
     session_id: str | None = None   # frontend sends this to keep history
 
 
-async def run_agent(messages: list, mode: str = "auto") -> str:
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+async def run_agent(messages: list, mode: str = "auto") -> dict:
+    # Dono servers ek saath connect — nested context managers
+    async with stdio_client(server_params) as (local_read, local_write):
+        async with ClientSession(local_read, local_write) as local_session:
+            async with streamablehttp_client(
+                LITELLM_URL, headers=LITELLM_HEADERS
+            ) as (litellm_read, litellm_write, _):
+                async with ClientSession(litellm_read, litellm_write) as litellm_session:
 
-            tools_response = await session.list_tools()
-            all_tools = [
-                {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.inputSchema,
-                }
-                for tool in tools_response.tools
-            ]
+                    # Dono sessions initialize
+                    await local_session.initialize()
+                    await litellm_session.initialize()
 
-            # --- mode / tool_choice setup ---
-            if mode == "auto":
-                active_tools = all_tools
-                tool_choice = {"type": "auto"}
-            else:
-                # only the selected tool
-                active_tools = [t for t in all_tools if t["name"] == mode]
-                if not active_tools:
-                    # invalid mode -> safe fallback
-                    active_tools = all_tools
-                    tool_choice = {"type": "auto"}
-                else:
-                    tool_choice = {"type": "tool", "name": mode}
+                    # --- LOCAL tools ---
+                    local_tools_resp = await local_session.list_tools()
+                    local_tool_names = {t.name for t in local_tools_resp.tools}
+                    local_tools = [
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.inputSchema,
+                        }
+                        for t in local_tools_resp.tools
+                    ]
 
-            while True:
-                response = anthropic.messages.create(
-                    model="claude-haiku-4-5",
-                    max_tokens=1000,
-                    system=SYSTEM_PROMPT,
-                    messages=messages,
-                    tools=active_tools,
-                    tool_choice=tool_choice,
-                )
-                messages.append({"role": "assistant", "content": response.content})
+                    # --- LITELLM tools ---
+                    litellm_tools_resp = await litellm_session.list_tools()
+                    litellm_tool_names = {t.name for t in litellm_tools_resp.tools}
+                    litellm_tools = [
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.inputSchema,
+                        }
+                        for t in litellm_tools_resp.tools
+                    ]
 
-                if response.stop_reason != "tool_use":
-                    final = ""
-                    for block in response.content:
-                        if block.type == "text":
-                            final += block.text
+                    # --- MERGE dono ---
+                    all_tools = local_tools + litellm_tools
 
-                    if "CHART_DATA::" in final:
-                        parts = final.split("CHART_DATA::")
-                       # "Render this chart in the UI:" text hata do
-                        text_part = parts[0].replace("Render this chart in the UI:", "").strip()
-                        # JSON sirf pehli line tak hai, baad ka text ignore karo
-                        raw = parts[1].strip()
-                        # pehla valid JSON object extract karo
-                        brace_count = 0
-                        json_end = 0
-                        for i, ch in enumerate(raw):
-                            if ch == "{":
-                                brace_count += 1
-                            elif ch == "}":
-                                brace_count -= 1
-                                if brace_count == 0:
-                                    json_end = i + 1
-                                    break
-                        chart_part = json.loads(raw[:json_end])
-                        # text empty hai to chart title fallback
-                        if not text_part:
-                            text_part = f"📊 {chart_part.get('title', 'Chart')}"
-                        
-                        return {"text": text_part, "chart_data": chart_part}
+                    # --- mode / tool_choice setup ---
+                    if mode == "auto":
+                        active_tools = all_tools
+                        tool_choice = {"type": "auto"}
+                    else:
+                        active_tools = [t for t in all_tools if t["name"] == mode]
+                        if not active_tools:
+                            active_tools = all_tools
+                            tool_choice = {"type": "auto"}
+                        else:
+                            tool_choice = {"type": "tool", "name": mode}
 
-                    return {"text": final, "chart_data": None}
+                    # --- Agentic loop ---
+                    while True:
+                        response = anthropic.messages.create(
+                            model="claude-haiku-4-5",
+                            max_tokens=1000,
+                            system=SYSTEM_PROMPT,
+                            messages=messages,
+                            tools=active_tools,
+                            tool_choice=tool_choice,
+                        )
+                        messages.append({"role": "assistant", "content": response.content})
 
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        result = await session.call_tool(block.name, block.input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result.content,
-                        })
-                messages.append({"role": "user", "content": tool_results})
+                        if response.stop_reason != "tool_use":
+                            final = ""
+                            for block in response.content:
+                                if block.type == "text":
+                                    final += block.text
 
-                # IMPORTANT: after the first forced call, switch to AUTO
-                # otherwise the model keeps calling the same tool in a loop
-                tool_choice = {"type": "auto"}
+                            if "CHART_DATA::" in final:
+                                parts = final.split("CHART_DATA::")
+                                text_part = parts[0].replace("Render this chart in the UI:", "").strip()
+                                raw = parts[1].strip()
+                                brace_count = 0
+                                json_end = 0
+                                for i, ch in enumerate(raw):
+                                    if ch == "{":
+                                        brace_count += 1
+                                    elif ch == "}":
+                                        brace_count -= 1
+                                        if brace_count == 0:
+                                            json_end = i + 1
+                                            break
+                                chart_part = json.loads(raw[:json_end])
+                                if not text_part:
+                                    text_part = f"📊 {chart_part.get('title', 'Chart')}"
+                                return {"text": text_part, "chart_data": chart_part}
+
+                            return {"text": final, "chart_data": None}
+
+                        # --- TOOL EXECUTION with ROUTING ---
+                        tool_results = []
+                        for block in response.content:
+                            if block.type == "tool_use":
+                                # ROUTING: kaunse server ka tool hai?
+                                if block.name in local_tool_names:
+                                    result = await local_session.call_tool(block.name, block.input)
+                                elif block.name in litellm_tool_names:
+                                    result = await litellm_session.call_tool(block.name, block.input)
+                                else:
+                                    result = None
+
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": result.content if result else "Tool not found",
+                                })
+                        messages.append({"role": "user", "content": tool_results})
+
+                        tool_choice = {"type": "auto"}
 
 
 @app.get("/")

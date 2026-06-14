@@ -13,7 +13,80 @@ load_dotenv()
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 # MCP server banaya — naam diya "Demo"
-mcp = FastMCP("Demo")
+mcp = FastMCP("ABM AI")
+
+# ============================================================
+# RESOURCES
+# ============================================================
+
+@mcp.resource("resource://abm/info")
+def get_server_info() -> str:
+    """Basic identity and description of ABM AI server."""
+    return json.dumps({
+        "name": "ABM AI",
+        "version": "1.0.0",
+        "description": "AI-powered assistant with tools for weather, stocks, news, charts and web search.",
+        "author": "Abhishek",
+        "transport": "Streamable HTTP"
+    }, indent=2)
+
+
+@mcp.resource("resource://abm/tools")
+def get_tools_list() -> str:
+    """List of all available tools in ABM AI and what they do."""
+    return json.dumps({
+        "tools": [
+            {
+                "name": "calculate",
+                "description": "Solves mathematical expressions",
+                "example": "4 + 5 * 2"
+            },
+            {
+                "name": "fetch_url",
+                "description": "Fetches and explains content from any URL",
+                "example": "https://example.com"
+            },
+            {
+                "name": "web_search",
+                "description": "Searches the web using Tavily",
+                "example": "Latest AI news 2026"
+            },
+            {
+                "name": "get_stock_price",
+                "description": "Returns live price for NSE/US stocks",
+                "example": "RELIANCE.NS"
+            },
+            {
+                "name": "get_weather",
+                "description": "Returns current weather for any city",
+                "example": "Noida"
+            },
+            {
+                "name": "get_chart_data",
+                "description": "Generates bar, line, or pie chart data",
+                "example": "bar chart of stock prices"
+            },
+            {
+                "name": "get_historical_chart",
+                "description": "Returns historical price trend chart for a stock",
+                "example": "RELIANCE.NS 1mo"
+            }
+        ]
+    }, indent=2)
+
+
+@mcp.resource("resource://abm/status")
+def get_server_status() -> str:
+    """Current status and runtime info of ABM AI server."""
+    from datetime import datetime
+    return json.dumps({
+        "status": "online",
+        "server": "ABM AI v1.0.0",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "tools_count": 7,
+        "resources_count": 3,
+        "message": "All systems operational"
+    }, indent=2)
 
 
 # @mcp.tool() decorator is function ko ek "tool" bana deta hai
@@ -54,7 +127,7 @@ def fetch_url(url: str) -> str:
         return f"Could not fetch '{url}'. Error: {str(e)}"
 
 # MCP Tool for web search using Tavily
-@mcp.tool()
+#@mcp.tool()
 def web_search(query: str) -> str:
     response = tavily_client.search(query, max_results=5)
     # Results ko clean text me convert karo (model ke liye)
@@ -64,7 +137,7 @@ def web_search(query: str) -> str:
     return "\n\n".join(results) if results else "No result found."
 
 # Stock price MCP tool
-@mcp.tool()
+#@mcp.tool()
 def get_stock_price(symbol: str) -> str:
     """Get the current price, change %, and basic info for a stock.
     For Indian (NSE) stocks, add .NS after the symbol (e.g. RELIANCE.NS, TCS.NS).
@@ -91,7 +164,7 @@ def get_stock_price(symbol: str) -> str:
 
 
 # MCP tool for getting current weather of a city using Open-Meteo API
-@mcp.tool()
+#@mcp.tool()
 def get_weather(city: str) -> str:
     """Get the current weather for a city (temperature, wind, conditions).
     Works for any city worldwide, e.g. 'Noida', 'London', 'Tokyo'.
@@ -172,7 +245,7 @@ def get_historical_chart(symbol: str, period: str = "1wk") -> str:
     values = [round(float(p), 2) for p in hist["Close"]]
 
     chart = {
-        "type": "bar",
+        "type": "line",
         "labels": labels,
         "values": values,
         "title": f"{symbol} - {period} Price Trend"

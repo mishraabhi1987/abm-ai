@@ -26,7 +26,7 @@ export default function Artifacts() {
   const [error, setError] = useState("");
 
   const C = {
-    red: "#E2492E",
+    red: "#bb0e0e",
     muted: "#8a8a90",
     border: "rgba(255,255,255,0.08)",
     panel: "#141417",

@@ -127,7 +127,7 @@ def fetch_url(url: str) -> str:
         return f"Could not fetch '{url}'. Error: {str(e)}"
 
 # MCP Tool for web search using Tavily
-#@mcp.tool()
+@mcp.tool()
 def web_search(query: str) -> str:
     response = tavily_client.search(query, max_results=5)
     # Results ko clean text me convert karo (model ke liye)

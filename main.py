@@ -130,7 +130,7 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
                     while True:
                         response = anthropic.messages.create(
                             model="claude-haiku-4-5",
-                            max_tokens=1000,
+                            max_tokens=8000,
                             system=SYSTEM_PROMPT,
                             messages=messages,
                             tools=active_tools,
@@ -143,11 +143,13 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
                             for block in response.content:
                                 if block.type == "text":
                                     final += block.text
-
+ 
                             if "CHART_DATA::" in final:
                                 parts = final.split("CHART_DATA::")
                                 text_part = parts[0].replace("Render this chart in the UI:", "").strip()
-                                raw = parts[1].strip()
+                                raw = parts[1].strip() if len(parts) > 1 else ""
+ 
+                                # find the balanced {...} JSON block after the marker
                                 brace_count = 0
                                 json_end = 0
                                 for i, ch in enumerate(raw):
@@ -158,12 +160,26 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
                                         if brace_count == 0:
                                             json_end = i + 1
                                             break
-                                chart_part = json.loads(raw[:json_end])
-                                if not text_part:
-                                    text_part = f"📊 {chart_part.get('title', 'Chart')}"
-                                return {"text": text_part, "chart_data": chart_part}
-
+ 
+                                # GUARD: only parse if we actually found a complete JSON block
+                                chart_part = None
+                                if json_end > 0:
+                                    try:
+                                        chart_part = json.loads(raw[:json_end])
+                                    except json.JSONDecodeError:
+                                        chart_part = None  # malformed/truncated -> show text only
+ 
+                                if chart_part is not None:
+                                    if not text_part:
+                                        text_part = f"📊 {chart_part.get('title', 'Chart')}"
+                                    return {"text": text_part, "chart_data": chart_part}
+ 
+                                # chart missing/broken -> graceful text, NEVER a 500
+                                fallback = text_part or final.replace("CHART_DATA::", "").strip()
+                                return {"text": fallback, "chart_data": None}
+ 
                             return {"text": final, "chart_data": None}
+ 
 
                         # --- TOOL EXECUTION with ROUTING ---
                         tool_results = []
@@ -268,7 +284,7 @@ async def run_lyrics(mood: str, theme: str = "", anchor: str = "") -> str:
             # 3. Standards as system, brief as the user turn -> Claude writes the lyrics.
             response = anthropic.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=1500,
+                max_tokens=8000,
                 system=standards,
                 messages=[{"role": "user", "content": brief}],
             )

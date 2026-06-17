@@ -4,15 +4,13 @@ const SAMPLE = `<!doctype html>
 <html>
 <head>
 <style>
-  body{margin:0;min-height:100vh;display:grid;place-items:center;
-       font-family:system-ui,sans-serif;background:#0a0a0c;color:#e7e7ea}
+  body{margin:0;min-height:100vh;display:grid;place-items:center; font-family:system-ui,sans-serif;background:#0a0a0c;color:#e7e7ea}
   .card{padding:28px 34px;border-radius:16px;background:#161618;
         border:1px solid rgba(255,255,255,.08);text-align:center}
   h1{margin:0 0 4px;font-size:20px;letter-spacing:.5px}
   h1 b{color:#E2492E}
   p{margin:0 0 18px;color:#8a8a90;font-size:14px}
-  button{border:0;border-radius:10px;padding:10px 18px;cursor:pointer;
-         background:#E2492E;color:#fff;font-size:15px;font-weight:600}
+  button{border:0;border-radius:10px;padding:10px 18px;cursor:pointer; background:#E2492E;color:#fff;font-size:15px;font-weight:600}
   #n{color:#E9A23B}
 </style>
 </head>
@@ -27,6 +25,53 @@ const SAMPLE = `<!doctype html>
   </div>
 </body>
 </html>`;
+
+// Injected into every preview. Two jobs:
+// 1) localStorage/sessionStorage shim — sandboxed iframes throw a SecurityError
+//    on storage access, which silently kills the whole script (blank screen).
+// 2) Surface runtime errors visibly instead of failing into a blank canvas.
+const PREVIEW_HARNESS = `<script>
+(function(){
+  try {
+    var mem = {};
+    var shim = {
+      getItem: function(k){ return Object.prototype.hasOwnProperty.call(mem,k) ? mem[k] : null; },
+      setItem: function(k,v){ mem[k] = String(v); },
+      removeItem: function(k){ delete mem[k]; },
+      clear: function(){ mem = {}; },
+      key: function(i){ return Object.keys(mem)[i] || null; }
+    };
+    Object.defineProperty(shim, "length", { get: function(){ return Object.keys(mem).length; } });
+    Object.defineProperty(window, "localStorage", { value: shim, configurable: true });
+    Object.defineProperty(window, "sessionStorage", { value: shim, configurable: true });
+  } catch (e) {}
+
+  function showErr(msg){
+    var d = document.getElementById("__previewErr");
+    if(!d){
+      d = document.createElement("div");
+      d.id = "__previewErr";
+      d.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#7f1d1d;color:#fff;font:12px/1.5 ui-monospace,monospace;padding:8px 12px;white-space:pre-wrap";
+      (document.body || document.documentElement).appendChild(d);
+    }
+    d.textContent = "\u26a0 " + msg;
+  }
+  window.addEventListener("error", function(e){ showErr(e.message + (e.lineno ? (" (line " + e.lineno + ")") : "")); });
+  window.addEventListener("unhandledrejection", function(e){ showErr("Promise: " + ((e.reason && e.reason.message) || e.reason)); });
+})();
+</script>`;
+
+// Insert the harness as early as possible so it runs before user scripts.
+function wrapForPreview(code) {
+  if (!code) return "";
+  if (/<head[^>]*>/i.test(code))
+    return code.replace(/<head[^>]*>/i, (m) => m + PREVIEW_HARNESS);
+  if (/<html[^>]*>/i.test(code))
+    return code.replace(/<html[^>]*>/i, (m) => m + PREVIEW_HARNESS);
+  if (/<body[^>]*>/i.test(code))
+    return code.replace(/<body[^>]*>/i, (m) => m + PREVIEW_HARNESS);
+  return PREVIEW_HARNESS + code;
+}
 
 // tiny dependency-free icons
 const IconCode = () => (
@@ -210,9 +255,9 @@ export default function CodeArtifact({ initialCode = SAMPLE }) {
           </button>
           <iframe
             key={runKey}
-            srcDoc={code}
+            srcDoc={code} // <-- wrapForPreview hata diya, wapas seedha code
             title="preview"
-            sandbox="allow-scripts allow-modals"
+            sandbox="allow-scripts allow-modals allow-same-origin"
             style={{
               width: "100%",
               flex: 1,

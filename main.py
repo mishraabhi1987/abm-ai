@@ -2,6 +2,8 @@ import sys
 import os
 import uuid
 import json
+import asyncio
+from contextlib import AsyncExitStack
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +39,7 @@ LITELLM_URL = "https://litellm.tfscreener.com/mcp/"
 LITELLM_HEADERS = {
     "Authorization": f"Bearer {os.getenv('LITELLM_API_KEY')}",
 }
+LOCAL_PRIORITY = True  # local tool wins on name collision with LiteLLM
 
 now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
@@ -75,162 +78,181 @@ class ChatRequest(BaseModel):
 
 
 async def run_agent(messages: list, mode: str = "auto") -> dict:
-    # Dono servers ek saath connect — nested context managers
-    async with stdio_client(server_params) as (local_read, local_write):
-        async with ClientSession(local_read, local_write) as local_session:
-            async with streamablehttp_client(
-                LITELLM_URL, headers=LITELLM_HEADERS
-            ) as (litellm_read, litellm_write, _):
-                async with ClientSession(litellm_read, litellm_write) as litellm_session:
+    async with AsyncExitStack() as stack:
+        # --- Local session (mandatory) ---
+        local_read, local_write = await stack.enter_async_context(
+            stdio_client(server_params)
+        )
+        local_session = await stack.enter_async_context(
+            ClientSession(local_read, local_write)
+        )
+        await local_session.initialize()
+        local_tools_resp = await local_session.list_tools()
+        local_tools = [
+            {
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.inputSchema,
+            }
+            for t in local_tools_resp.tools
+        ]
 
-                    # Dono sessions initialize
-                    await local_session.initialize()
-                    await litellm_session.initialize()
+        # --- LiteLLM session (optional, 5 s timeout) ---
+        litellm_session = None
+        litellm_tools = []
 
-                    # --- LOCAL tools ---
-                    local_tools_resp = await local_session.list_tools()
-                    local_tool_names = {t.name for t in local_tools_resp.tools}
-                    local_tools = [
-                        {
-                            "name": t.name,
-                            "description": t.description,
-                            "input_schema": t.inputSchema,
-                        }
-                        for t in local_tools_resp.tools
-                    ]
+        async def _open_litellm(s: AsyncExitStack):
+            r, w, _ = await s.enter_async_context(
+                streamablehttp_client(LITELLM_URL, headers=LITELLM_HEADERS)
+            )
+            ls = await s.enter_async_context(ClientSession(r, w))
+            await ls.initialize()
+            resp = await ls.list_tools()
+            return ls, [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.inputSchema,
+                }
+                for t in resp.tools
+            ]
 
-                    # --- LITELLM tools ---
-                    litellm_tools_resp = await litellm_session.list_tools()
-                    litellm_tool_names = {t.name for t in litellm_tools_resp.tools}
-                    litellm_tools = [
-                        {
-                            "name": t.name,
-                            "description": t.description,
-                            "input_schema": t.inputSchema,
-                        }
-                        for t in litellm_tools_resp.tools
-                    ]
+        _litellm_stack = AsyncExitStack()
+        try:
+            litellm_session, litellm_tools = await asyncio.wait_for(
+                _open_litellm(_litellm_stack), timeout=5.0
+            )
+            await stack.enter_async_context(_litellm_stack)
+        except Exception as e:
+            await _litellm_stack.aclose()
+            print(f"Warning: LiteLLM unavailable ({type(e).__name__}), using local tools only.")
 
-                    # --- MERGE dono ---
-                    all_tools = local_tools + litellm_tools
+        # --- Routing map: tool_name -> session (LOCAL_PRIORITY: local wins on collision) ---
+        tool_routing: dict = {}
+        for t in litellm_tools:
+            tool_routing[t["name"]] = litellm_session
+        if LOCAL_PRIORITY:
+            for t in local_tools:
+                tool_routing[t["name"]] = local_session
 
-                    # --- mode / tool_choice setup ---
-                    if mode == "auto":
-                        active_tools = all_tools
-                        tool_choice = {"type": "auto"}
-                    else:
-                        active_tools = [t for t in all_tools if t["name"] == mode]
-                        if not active_tools:
-                            active_tools = all_tools
-                            tool_choice = {"type": "auto"}
-                        else:
-                            tool_choice = {"type": "tool", "name": mode}
+        # --- Deduplicate tools sent to Claude (local wins on collision) ---
+        seen_names: set = set()
+        all_tools = []
+        for t in local_tools + litellm_tools:
+            if t["name"] not in seen_names:
+                seen_names.add(t["name"])
+                all_tools.append(t)
 
-                    # --- Agentic loop ---
-                    while True:
-                        response = await anthropic.messages.create(
-                            model="claude-haiku-4-5",
-                            max_tokens=8000,
-                            system=SYSTEM_PROMPT,
-                            messages=messages,
-                            tools=active_tools,
-                            tool_choice=tool_choice,
-                        )
-                        messages.append({"role": "assistant", "content": response.content})
+        # --- mode / tool_choice setup ---
+        if mode == "auto":
+            active_tools = all_tools
+            tool_choice = {"type": "auto"}
+        else:
+            active_tools = [t for t in all_tools if t["name"] == mode]
+            if not active_tools:
+                active_tools = all_tools
+                tool_choice = {"type": "auto"}
+            else:
+                tool_choice = {"type": "tool", "name": mode}
 
-                        if response.stop_reason != "tool_use":
-                            final = ""
-                            for block in response.content:
-                                if block.type == "text":
-                                    final += block.text
- 
-                            if "CHART_DATA::" in final:
-                                parts = final.split("CHART_DATA::")
-                                text_part = parts[0].replace("Render this chart in the UI:", "").strip()
-                                raw = parts[1].strip() if len(parts) > 1 else ""
- 
-                                # find the balanced {...} JSON block after the marker
-                                brace_count = 0
-                                json_end = 0
-                                for i, ch in enumerate(raw):
-                                    if ch == "{":
-                                        brace_count += 1
-                                    elif ch == "}":
-                                        brace_count -= 1
-                                        if brace_count == 0:
-                                            json_end = i + 1
-                                            break
- 
-                                # GUARD: only parse if we actually found a complete JSON block
-                                chart_part = None
-                                if json_end > 0:
-                                    try:
-                                        chart_part = json.loads(raw[:json_end])
-                                    except json.JSONDecodeError:
-                                        chart_part = None  # malformed/truncated -> show text only
- 
-                                if chart_part is not None:
-                                    if not text_part:
-                                        text_part = f"📊 {chart_part.get('title', 'Chart')}"
-                                    return {"text": text_part, "chart_data": chart_part}
- 
-                                # chart missing/broken -> graceful text, NEVER a 500
-                                fallback = text_part or final.replace("CHART_DATA::", "").strip()
-                                return {"text": fallback, "chart_data": None}
- 
-                            return {"text": final, "chart_data": None}
- 
+        # --- Agentic loop ---
+        while True:
+            response = await anthropic.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=8000,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=active_tools,
+                tool_choice=tool_choice,
+            )
+            messages.append({"role": "assistant", "content": response.content})
 
-                        # --- TOOL EXECUTION with ROUTING ---
-                        tool_results = []
-                        for block in response.content:
-                            if block.type == "tool_use":
-                                # ROUTING: kaunse server ka tool hai?
-                                if block.name in local_tool_names:
-                                    result = await local_session.call_tool(block.name, block.input)
-                                elif block.name in litellm_tool_names:
-                                    result = await litellm_session.call_tool(block.name, block.input)
-                                else:
-                                    result = None
+            if response.stop_reason != "tool_use":
+                final = ""
+                for block in response.content:
+                    if block.type == "text":
+                        final += block.text
 
-                                # --- FIX: Parse MCP content to match Anthropic strict schema ---
-                                formatted_content = []
-                                if result and hasattr(result, "content") and result.content:
-                                    for item in result.content:
-                                        if item.type == "text":
-                                            formatted_content.append({
-                                                "type": "text", 
-                                                "text": item.text
-                                            })
-                                        elif item.type == "image":
-                                            # Anthropic expects 'source' wrapper and 'media_type' instead of 'mimeType'
-                                            formatted_content.append({
-                                                "type": "image",
-                                                "source": {
-                                                    "type": "base64",
-                                                    "media_type": getattr(item, "mimeType", "image/jpeg"), 
-                                                    "data": item.data
-                                                }
-                                            })
-                                        else:
-                                            # Fallback for any unknown types
-                                            formatted_content.append({
-                                                "type": "text", 
-                                                "text": str(item)
-                                            })
-                                else:
-                                    formatted_content = "Tool not found or returned empty result"
-                                # -------------------------------------------------------------
+                if "CHART_DATA::" in final:
+                    parts = final.split("CHART_DATA::")
+                    text_part = parts[0].replace("Render this chart in the UI:", "").strip()
+                    raw = parts[1].strip() if len(parts) > 1 else ""
 
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": formatted_content,
+                    # find the balanced {...} JSON block after the marker
+                    brace_count = 0
+                    json_end = 0
+                    for i, ch in enumerate(raw):
+                        if ch == "{":
+                            brace_count += 1
+                        elif ch == "}":
+                            brace_count -= 1
+                            if brace_count == 0:
+                                json_end = i + 1
+                                break
+
+                    # GUARD: only parse if we actually found a complete JSON block
+                    chart_part = None
+                    if json_end > 0:
+                        try:
+                            chart_part = json.loads(raw[:json_end])
+                        except json.JSONDecodeError:
+                            chart_part = None  # malformed/truncated -> show text only
+
+                    if chart_part is not None:
+                        if not text_part:
+                            text_part = f"📊 {chart_part.get('title', 'Chart')}"
+                        return {"text": text_part, "chart_data": chart_part}
+
+                    # chart missing/broken -> graceful text, NEVER a 500
+                    fallback = text_part or final.replace("CHART_DATA::", "").strip()
+                    return {"text": fallback, "chart_data": None}
+
+                return {"text": final, "chart_data": None}
+
+            # --- TOOL EXECUTION with ROUTING ---
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    session = tool_routing.get(block.name)
+                    result = await session.call_tool(block.name, block.input) if session else None
+
+                    # --- Parse MCP content to match Anthropic strict schema ---
+                    formatted_content = []
+                    if result and hasattr(result, "content") and result.content:
+                        for item in result.content:
+                            if item.type == "text":
+                                formatted_content.append({
+                                    "type": "text",
+                                    "text": item.text
                                 })
-                        if not tool_results:
-                            break
-                        messages.append({"role": "user", "content": tool_results})
-                        tool_choice = {"type": "auto"}
+                            elif item.type == "image":
+                                # Anthropic expects 'source' wrapper and 'media_type' instead of 'mimeType'
+                                formatted_content.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": getattr(item, "mimeType", "image/jpeg"),
+                                        "data": item.data
+                                    }
+                                })
+                            else:
+                                # Fallback for any unknown types
+                                formatted_content.append({
+                                    "type": "text",
+                                    "text": str(item)
+                                })
+                    else:
+                        formatted_content = "Tool not found or returned empty result"
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": formatted_content,
+                    })
+            if not tool_results:
+                break
+            messages.append({"role": "user", "content": tool_results})
+            tool_choice = {"type": "auto"}
 
 
 @app.get("/")

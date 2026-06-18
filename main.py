@@ -193,14 +193,41 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
                                 else:
                                     result = None
 
+                                # --- FIX: Parse MCP content to match Anthropic strict schema ---
+                                formatted_content = []
+                                if result and hasattr(result, "content") and result.content:
+                                    for item in result.content:
+                                        if item.type == "text":
+                                            formatted_content.append({
+                                                "type": "text", 
+                                                "text": item.text
+                                            })
+                                        elif item.type == "image":
+                                            # Anthropic expects 'source' wrapper and 'media_type' instead of 'mimeType'
+                                            formatted_content.append({
+                                                "type": "image",
+                                                "source": {
+                                                    "type": "base64",
+                                                    "media_type": getattr(item, "mimeType", "image/jpeg"), 
+                                                    "data": item.data
+                                                }
+                                            })
+                                        else:
+                                            # Fallback for any unknown types
+                                            formatted_content.append({
+                                                "type": "text", 
+                                                "text": str(item)
+                                            })
+                                else:
+                                    formatted_content = "Tool not found or returned empty result"
+                                # -------------------------------------------------------------
+
                                 tool_results.append({
                                     "type": "tool_result",
                                     "tool_use_id": block.id,
-                                    "content": result.content if result else "Tool not found",
+                                    "content": formatted_content,
                                 })
                         messages.append({"role": "user", "content": tool_results})
-
-                        tool_choice = {"type": "auto"}
 
 
 @app.get("/")

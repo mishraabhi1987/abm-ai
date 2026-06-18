@@ -1,18 +1,23 @@
-// FastAPI backend se baat karne wala layer
-// session_id yahin manage hota hai (frontend memory)
+// FastAPI backend communication layer.
+// sessionId is module-level for the main chat tab.
+// Artifacts manages its own sessionId and passes it explicitly via the options arg.
 
 let sessionId = null;
 
-// Main chat function — message bhejta hai, jawab laata hai
-export async function sendMessage(message, mode = "auto") {
+export async function sendMessage(
+  message,
+  mode = "auto",
+  { sessionId: sessionIdIn = null, attachments = null } = {}
+) {
+  const sid = sessionIdIn ?? sessionId;
+
+  const body = { message, mode, session_id: sid };
+  if (attachments?.length) body.attachments = attachments;
+
   const res = await fetch("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: message,
-      mode: mode,
-      session_id: sessionId,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -21,16 +26,16 @@ export async function sendMessage(message, mode = "auto") {
 
   const data = await res.json();
 
-  // backend se mila session_id save karo (agle message ke liye)
-  sessionId = data.session_id;
+  // Only update the module-level sessionId for the main chat tab
+  if (!sessionIdIn) sessionId = data.session_id;
 
   return {
     answer: data.answer,
     chartData: data.chart_data,
+    sessionId: data.session_id,
   };
 }
 
-// New Chat button ke liye — history clear karo
 export async function newChat() {
   if (sessionId) {
     await fetch("/new", {
@@ -39,19 +44,17 @@ export async function newChat() {
       body: JSON.stringify({ session_id: sessionId }),
     });
   }
-  sessionId = null; // reset
+  sessionId = null;
 }
 
-// If your existing file already defines a BASE/API_URL constant, reuse it
-// and delete this line. Otherwise set it to your FastAPI origin.
-const LYRICS_API_BASE = "http://localhost:8000"; // <-- match your /chat base
+const LYRICS_API_BASE = "http://localhost:8000";
 
 export async function generateLyrics(prompt) {
   const res = await fetch(`${LYRICS_API_BASE}/api/lyrics`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mood: prompt }), // whole input passed as mood/genre
+    body: JSON.stringify({ mood: prompt }),
   });
   if (!res.ok) throw new Error(`Lyrics request failed (${res.status})`);
-  return res.json(); // { lyrics: "..." }
+  return res.json();
 }

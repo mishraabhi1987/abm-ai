@@ -7,7 +7,11 @@ import { sendMessage, generateLyrics } from "../api/chat";
 const CODE_INSTRUCTION =
   "You are a code generator. Output ONE complete, self-contained HTML document " +
   "with inline <style> and <script> (HTML + CSS + JS in a single file). " +
-  "Return ONLY the raw code — no explanation, no markdown fences. Request: ";
+  "Return ONLY the raw code — no explanation, no markdown fences. " +
+  "IMPORTANT: if you already produced code earlier in this conversation, " +
+  "MODIFY that existing code to satisfy the new request — keep everything else intact. " +
+  "Do NOT rebuild from scratch unless the request explicitly asks for it. " +
+  "Default to a black or near-black page background unless the request specifies otherwise. Request: ";
 
 function extractCode(text) {
   if (!text) return "";
@@ -24,6 +28,9 @@ export default function Artifacts() {
   const [loading, setLoading] = useState(false);
   const [output, setOutput] = useState(null); // { type, code|text }
   const [error, setError] = useState("");
+  // Code mode maintains its own session for multi-turn refinement.
+  // Lyrics is always stateless (one-shot); no session needed.
+  const [artifactsSessionId, setArtifactsSessionId] = useState(null);
 
   const C = {
     red: "#bb0e0e",
@@ -31,6 +38,14 @@ export default function Artifacts() {
     border: "rgba(255,255,255,0.08)",
     panel: "#141417",
     bg: "#0d0d10",
+  };
+
+  const switchMode = (next) => {
+    setMode(next);
+    setOutput(null);
+    setError("");
+    // Reset session on mode switch so Code context doesn't bleed across switches
+    setArtifactsSessionId(null);
   };
 
   const handleGenerate = async () => {
@@ -41,7 +56,12 @@ export default function Artifacts() {
     setOutput(null);
     try {
       if (mode === "code") {
-        const { answer } = await sendMessage(CODE_INSTRUCTION + p);
+        const { answer, sessionId: newSid } = await sendMessage(
+          CODE_INSTRUCTION + p,
+          "auto",
+          { sessionId: artifactsSessionId }
+        );
+        setArtifactsSessionId(newSid);
         setOutput({ type: "code", code: extractCode(answer) });
       } else {
         const { lyrics } = await generateLyrics(p);
@@ -178,21 +198,13 @@ export default function Artifacts() {
             >
               <button
                 style={tab(mode === "code")}
-                onClick={() => {
-                  setMode("code");
-                  setOutput(null);
-                  setError("");
-                }}
+                onClick={() => switchMode("code")}
               >
                 Code
               </button>
               <button
                 style={tab(mode === "lyrics")}
-                onClick={() => {
-                  setMode("lyrics");
-                  setOutput(null);
-                  setError("");
-                }}
+                onClick={() => switchMode("lyrics")}
               >
                 Lyrics
               </button>

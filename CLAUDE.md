@@ -35,12 +35,14 @@ The system has two Python files and a legacy standalone client:
 
 **`main.py`** — FastAPI app and agentic loop. On each `/chat` POST it:
 
-1. Connects to both the local stdio MCP server and the remote LiteLLM MCP server simultaneously.
-2. Merges their tool lists (`local_tools + litellm_tools`).
-3. Runs an agentic loop calling `claude-haiku-4-5` with the merged tool set.
-4. Routes each `tool_use` block back to whichever server owns that tool name (`local_tool_names` vs `litellm_tool_names`).
-5. Parses MCP result content into Anthropic's strict schema (text/image) before appending as `tool_result`.
-6. Detects `CHART_DATA::` in the final text and splits it into `{"text": ..., "chart_data": {...}}` for the frontend to render.
+1. Connects to the local stdio MCP server (mandatory) via `AsyncExitStack`.
+2. Attempts to connect to the remote LiteLLM MCP server with a 5 s `asyncio.wait_for` timeout; any failure logs a warning and continues with local tools only — the request never 500s when LiteLLM is down.
+3. Builds a `tool_routing` dict (`tool_name → session`) with `LOCAL_PRIORITY = True` so local tools win on name collision.
+4. Deduplicates the merged tool list before sending to Claude — the Anthropic API never receives two tools with the same name.
+5. Runs an agentic loop calling `claude-haiku-4-5` (via `AsyncAnthropic`) with the deduplicated tool set.
+6. Routes each `tool_use` block through `tool_routing`; unknown tool names return an empty result.
+7. Parses MCP result content into Anthropic's strict schema (text/image) before appending as `tool_result`.
+8. Detects `CHART_DATA::` in the final text and splits it into `{"text": ..., "chart_data": {...}}` for the frontend to render.
 
 Conversation history is stored in memory per `session_id` in the `conversations` dict. `/new` clears a session.
 
@@ -54,15 +56,16 @@ Conversation history is stored in memory per `session_id` in the `conversations`
 
 ## Tool routing
 
-Tool names are partitioned into `local_tool_names` and `litellm_tool_names` sets at the start of each `run_agent` call. Any tool not in either set returns `None` and becomes an empty-result `tool_result`. There is no deduplication if both servers expose a tool with the same name — the first match (local) wins since routing checks local first.
+`run_agent` builds a single `tool_routing: dict[str, ClientSession]` at startup — LiteLLM tools are inserted first, then local tools overwrite any collision (`LOCAL_PRIORITY = True` constant). Every `call_tool` goes through this map; a tool name not in the map returns `None` (empty result). The tool list sent to Claude is deduplicated by the same priority: iterate `local_tools + litellm_tools`, skip any name already seen. To change collision behaviour, flip `LOCAL_PRIORITY`.
 
 ## Conventions & rules (always follow)
 
 - Always `source venv/bin/activate` before running anything. Python 3.13 venv.
 - MCP tool results MUST be parsed into Anthropic's strict text/image schema
   before appending as `tool_result` — malformed schema breaks the agentic loop.
-- Tool routing is local-first by design. Do NOT add deduplication logic;
-  if both servers expose the same tool name, local wins on purpose.
+- Tool routing is local-first by design (`LOCAL_PRIORITY = True`).
+  Deduplication is intentional — do not remove it. If both servers expose the
+  same tool name, local wins in both the routing map and the deduplicated tool list.
 - The `CHART_DATA::` payload must be passed through verbatim. Never reformat,
   re-indent, or "clean up" it.
 - `get_stock_price` and `get_weather` are intentionally commented out.

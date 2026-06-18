@@ -71,11 +71,13 @@ export default function App() {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
-  const handleSend = async (text) => {
+  const handleSend = async (text, attachments = []) => {
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setLoading(true);
     try {
-      const { answer, chartData } = await sendMessage(text);
+      const { answer, chartData } = await sendMessage(text, "auto", {
+        attachments: attachments.length ? attachments : null,
+      });
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: answer, chartData },

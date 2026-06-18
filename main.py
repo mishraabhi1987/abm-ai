@@ -3,8 +3,9 @@ import os
 import uuid
 import json
 import asyncio
+import base64
 from contextlib import AsyncExitStack
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -40,6 +41,7 @@ LITELLM_HEADERS = {
     "Authorization": f"Bearer {os.getenv('LITELLM_API_KEY')}",
 }
 LOCAL_PRIORITY = True  # local tool wins on name collision with LiteLLM
+ATTACH_LIMIT_BYTES = 15 * 1024 * 1024  # 15 MB decoded attachment ceiling
 
 now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
@@ -65,16 +67,40 @@ SYSTEM_PROMPT = (
     "you MUST copy that entire line including CHART_DATA:: and everything after it verbatim into your response."
 )
 
-# --- Session-based conversation store (in-memory) ---
-# Structure: { session_id: [list of messages] }
-# Each session keeps its own separate history.
-conversations = {}
+class SessionStore:
+    """In-memory session store with per-session message cap.
+    TODO: replace _store with an aiosqlite backend for persistence across restarts.
+    Interface contract: callers use only get / set / reset.
+    """
+    MAX_MESSAGES = 200
+
+    def __init__(self):
+        self._store: dict[str, list] = {}
+
+    def get(self, session_id: str) -> list:
+        return list(self._store.get(session_id, []))
+
+    def set(self, session_id: str, messages: list) -> None:
+        self._store[session_id] = messages[-self.MAX_MESSAGES :]
+
+    def reset(self, session_id: str) -> None:
+        self._store.pop(session_id, None)
+
+
+session_store = SessionStore()
+
+
+class Attachment(BaseModel):
+    filename: str
+    media_type: str
+    data_base64: str
 
 
 class ChatRequest(BaseModel):
     message: str = ""
     mode: str = "auto"
-    session_id: str | None = None   # frontend sends this to keep history
+    session_id: str | None = None
+    attachments: list[Attachment] | None = None
 
 
 async def run_agent(messages: list, mode: str = "auto") -> dict:
@@ -271,34 +297,51 @@ async def styles():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    # 1. get or create a session id
     session_id = req.session_id or str(uuid.uuid4())
 
-    # 2. get this session's history (or start empty)
-    history = conversations.get(session_id, [])
+    # Validate total attachment size
+    if req.attachments:
+        total = sum(len(a.data_base64) * 3 // 4 for a in req.attachments)
+        if total > ATTACH_LIMIT_BYTES:
+            raise HTTPException(status_code=413, detail="Attachments exceed 15 MB limit")
 
-    # 3. add the new user message
-    history.append({"role": "user", "content": req.message})
+    # Build content blocks for the user turn
+    content: list = []
+    if req.message:
+        content.append({"type": "text", "text": req.message})
+    for a in (req.attachments or []):
+        if a.media_type == "application/pdf":
+            content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": a.data_base64},
+            })
+        elif a.media_type.startswith("image/"):
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": a.media_type, "data": a.data_base64},
+            })
+        elif a.media_type in ("text/plain", "text/markdown"):
+            text = base64.b64decode(a.data_base64).decode("utf-8", errors="replace")[:4000]
+            content.append({"type": "text", "text": f"[{a.filename}]\n{text}"})
+    if not content:
+        content = [{"type": "text", "text": ""}]
 
-    # 4. run the agent with the FULL history (so it remembers context)
+    history = session_store.get(session_id)
+    history.append({"role": "user", "content": content})
     result = await run_agent(history, req.mode)
+    session_store.set(session_id, history)
 
-    # 5. save updated history back to this session
-    conversations[session_id] = history
-
-    # 6. return answer + chart_data + session_id
     return {
         "answer": result["text"],
         "chart_data": result["chart_data"],
-        "session_id": session_id
+        "session_id": session_id,
     }
 
 
 @app.post("/new")
 async def new_chat(req: ChatRequest):
-    # clear a session's history (New Chat button)
-    if req.session_id and req.session_id in conversations:
-        del conversations[req.session_id]
+    if req.session_id:
+        session_store.reset(req.session_id)
     return {"ok": True}
 
 # ============================================================

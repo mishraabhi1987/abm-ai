@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.stdio import stdio_client
@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 
 load_dotenv()
-anthropic = Anthropic()
+anthropic = AsyncAnthropic()
 app = FastAPI()
 
 app.add_middleware(
@@ -128,7 +128,7 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
 
                     # --- Agentic loop ---
                     while True:
-                        response = anthropic.messages.create(
+                        response = await anthropic.messages.create(
                             model="claude-haiku-4-5",
                             max_tokens=8000,
                             system=SYSTEM_PROMPT,
@@ -227,7 +227,10 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
                                     "tool_use_id": block.id,
                                     "content": formatted_content,
                                 })
+                        if not tool_results:
+                            break
                         messages.append({"role": "user", "content": tool_results})
+                        tool_choice = {"type": "auto"}
 
 
 @app.get("/")
@@ -309,7 +312,7 @@ async def run_lyrics(mood: str, theme: str = "", anchor: str = "") -> str:
             brief = pr.messages[0].content.text
 
             # 3. Standards as system, brief as the user turn -> Claude writes the lyrics.
-            response = anthropic.messages.create(
+            response = await anthropic.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=8000,
                 system=standards,

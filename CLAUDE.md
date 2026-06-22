@@ -4,12 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running the app
 
+Both backend servers must be running. Start them in separate terminals (or as background tasks):
+
 ```bash
 source venv/bin/activate
-uvicorn main:app --reload
+uvicorn main:app --reload           # Main app  → http://localhost:8000
+uvicorn agent_server:app --reload --port 8001  # Agent server → http://localhost:8001
 ```
 
-The server starts at `http://localhost:8000`. The UI is served from `index.html` / `style.css` at the root route.
+`main.py` serves the UI and chat API at `http://localhost:8000`. `agent_server.py` serves the Finance agent endpoint (`POST /api/agent/finance`) at `http://localhost:8001`. The Vite dev proxy routes `/api/agent` to port 8001 and `/chat`, `/new` to port 8000.
 
 To test the MCP server directly via the Inspector:
 
@@ -29,9 +32,11 @@ LITELLM_API_KEY=...
 
 ## Architecture
 
-The system has two Python files and a legacy standalone client:
+The system has three Python server files and two legacy standalone clients:
 
-**`server.py`** — Local MCP server (FastMCP). Runs as a subprocess via stdio. Provides tools: `calculate`, `fetch_url`, `web_search`, `get_chart_data`, `get_historical_chart`. Also exposes MCP resources (`resource://abm/*`) and a prompt (`lyrics_brief`) used by the lyrics feature. Note: `get_stock_price` and `get_weather` are defined but commented out (`#@mcp.tool()`).
+**`server.py`** — Local MCP server (FastMCP). Runs as a subprocess via stdio. Provides tools: `calculate`, `fetch_url`, `web_search`, `get_chart_data`, `get_historical_chart`. Also exposes MCP resources (`resource://abm/*`) and a prompt (`lyrics_brief`) used by the lyrics feature. Note: `get_stock_price` and `get_weather` are defined but commented out (`#@mcp.tool()`). `fetch_stock_price` and `fetch_stock_news` are plain Python functions (not MCP tools) imported directly by `agent_server.py`.
+
+**`agent_server.py`** — Separate FastAPI app on port 8001. Exposes `POST /api/agent/finance`. Calls `fetch_stock_price` and `fetch_stock_news` directly from `server.py` (not via MCP), then sends the result to Claude (`claude-sonnet-4-6`) for grounded analysis. No agentic loop — single Claude call per request. The Vite proxy routes `/api/agent` to this server.
 
 **`main.py`** — FastAPI app and agentic loop. On each `/chat` POST it:
 
@@ -52,6 +57,8 @@ Conversation history is stored in `SessionStore` (module-level `session_store`).
 **`/api/lyrics`** — Separate endpoint that connects only to the local MCP server, reads the `lyrics://standards` resource and `lyrics_brief` prompt, then calls Claude directly (no tool loop).
 
 **`client.py`** — Standalone CLI agentic loop for local testing only; not used by the web app.
+
+**`agents/finance_agent.py`** — Standalone CLI script for testing the Finance agent via `claude_agent_sdk`. Connects to `server.py` via stdio MCP and uses `mcp__stock__get_stock_price`, `mcp__stock__get_stock_news`, `mcp__stock__get_chart_data`. Not used by the web app — `agent_server.py` handles the web-facing Finance agent endpoint.
 
 ## Chart data flow
 
@@ -77,7 +84,7 @@ Conversation history is stored in `SessionStore` (module-level `session_store`).
   re-indent, or "clean up" it.
 - `get_stock_price` and `get_weather` are intentionally commented out.
   Do NOT re-enable without an explicit reason.
-- `client.py` is local-CLI only. Do NOT touch it for web-app changes.
+- `client.py` and `agents/finance_agent.py` are local-CLI only. Do NOT touch them for web-app changes. Web-facing Finance agent logic lives in `agent_server.py`.
 - Before any commit: show a summary of what changed and why, and WAIT for
   explicit approval. Never commit and push in the same step. Push only after
   the commit is approved.

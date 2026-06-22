@@ -44,7 +44,9 @@ async def main():
         allowed_tools=[
             "mcp__stock__get_stock_price",
             "mcp__stock__get_stock_news",
+            "mcp__stock__get_chart_data"
         ],
+        allowed_skills=[],  # no skills, only tools
         system_prompt=SYSTEM_PROMPT,
         max_turns=5,
     )

@@ -7,7 +7,7 @@ let sessionId = null;
 export async function sendMessage(
   message,
   mode = "auto",
-  { sessionId: sessionIdIn = null, attachments = null, model = "claude-haiku" } = {}
+  { sessionId: sessionIdIn = null, attachments = null, model } = {}
 ) {
   const sid = sessionIdIn ?? sessionId;
 

@@ -78,7 +78,7 @@ export default function App() {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
-  const handleSend = async (text, attachments = [], model = "claude-haiku") => {
+  const handleSend = async (text, attachments = [], model) => {
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setLoading(true);
     try {

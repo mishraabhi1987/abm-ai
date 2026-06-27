@@ -3,7 +3,13 @@ import { theme } from "../theme";
 import { inputAreaContainer, inputAreaTextarea } from "../styles/inputArea";
 import CodeArtifact from "./CodeArtifact";
 import CopyBlock from "./CopyBlock";
-import { sendMessage, generateLyrics } from "../api/chat";
+import { sendMessage } from "../api/chat";
+import { MODELS } from "../models";
+
+const LYRICS_INSTRUCTION =
+  "Write song lyrics based on the following request. " +
+  "Return ONLY the lyrics — no explanations, no title headers in brackets, " +
+  "no commentary. Request: ";
 
 const CODE_INSTRUCTION =
   "You are a code generator. Output ONE complete, self-contained HTML document " +
@@ -13,6 +19,19 @@ const CODE_INSTRUCTION =
   "MODIFY that existing code to satisfy the new request — keep everything else intact. " +
   "Do NOT rebuild from scratch unless the request explicitly asks for it. " +
   "Default to a black or near-black page background unless the request specifies otherwise. Request: ";
+
+const scrollbarStyle = `
+  .artifacts-scroll::-webkit-scrollbar { width: 6px; }
+  .artifacts-scroll::-webkit-scrollbar-track { background: transparent; }
+  .artifacts-scroll::-webkit-scrollbar-thumb {
+    background: ${theme.textFaint}55;
+    border-radius: 99px;
+    transition: background 0.2s;
+  }
+  .artifacts-scroll::-webkit-scrollbar-thumb:hover {
+    background: ${theme.textFaint}99;
+  }
+`;
 
 function extractCode(text) {
   if (!text) return "";
@@ -29,9 +48,11 @@ export default function Artifacts() {
   const [loading, setLoading] = useState(false);
   const [output, setOutput] = useState(null); // { type, code|text }
   const [error, setError] = useState("");
-  // Code mode maintains its own session for multi-turn refinement.
-  // Lyrics is always stateless (one-shot); no session needed.
+  // Each mode maintains its own session so neither bleeds into the other
+  // or into the Chat Bot's module-level sessionId.
   const [artifactsSessionId, setArtifactsSessionId] = useState(null);
+  const [lyricsSessionId, setLyricsSessionId] = useState(null);
+  const [selectedModel, setSelectedModel] = useState("gemini");
 
   const C = {
     red: "#bb0e0e",
@@ -45,8 +66,8 @@ export default function Artifacts() {
     setMode(next);
     setOutput(null);
     setError("");
-    // Reset session on mode switch so Code context doesn't bleed across switches
     setArtifactsSessionId(null);
+    setLyricsSessionId(null);
   };
 
   const handleGenerate = async () => {
@@ -60,13 +81,18 @@ export default function Artifacts() {
         const { answer, sessionId: newSid } = await sendMessage(
           CODE_INSTRUCTION + p,
           "auto",
-          { sessionId: artifactsSessionId }
+          { sessionId: artifactsSessionId, model: selectedModel }
         );
         setArtifactsSessionId(newSid);
         setOutput({ type: "code", code: extractCode(answer) });
       } else {
-        const { lyrics } = await generateLyrics(p);
-        setOutput({ type: "lyrics", text: lyrics });
+        const { answer, sessionId: newSid } = await sendMessage(
+          LYRICS_INSTRUCTION + p,
+          "auto",
+          { sessionId: lyricsSessionId, model: selectedModel }
+        );
+        setLyricsSessionId(newSid);
+        setOutput({ type: "lyrics", text: answer });
       }
     } catch (e) {
       setError(e.message || "Something went wrong. Try again.");
@@ -130,7 +156,17 @@ export default function Artifacts() {
             <CodeArtifact initialCode={output.code} />
           )}
           {output?.type === "lyrics" && (
-            <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+            <div
+              className="artifacts-scroll"
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflowY: "auto",
+                scrollbarWidth: "thin",
+                scrollbarColor: `${theme.textFaint}55 transparent`,
+              }}
+            >
+              <style>{scrollbarStyle}</style>
               <CopyBlock content={output.text} label="Lyrics" />
             </div>
           )}
@@ -192,28 +228,55 @@ export default function Artifacts() {
               </button>
             </div>
 
-            <button
-              type="button"
-              onClick={handleGenerate}
-              disabled={loading}
-              style={{
-                padding: "13px 30px",
-                background: loading ? "#5a3a2a" : "#c70505",
-                color: "#fff",
-                border: "none",
-                borderRadius: 10,
-                cursor: loading ? "not-allowed" : "pointer",
-                fontSize: 15,
-                fontWeight: 700,
-                transition: "background 0.2s, box-shadow 0.2s",
-              }}
-            >
-              {loading
-                ? "Generating…"
-                : mode === "code"
-                  ? "Generate code →"
-                  : "Write lyrics →"}
-            </button>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <select
+                aria-label="Model"
+                value={selectedModel}
+                onChange={(e) => {
+                  setSelectedModel(e.target.value);
+                  setArtifactsSessionId(null);
+                }}
+                title="Select model"
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  border: `1.5px solid ${theme.line}`,
+                  background: theme.bgSoft,
+                  color: theme.text,
+                  fontFamily: theme.sora,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  outline: "none",
+                }}
+              >
+                {MODELS.map(m => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={handleGenerate}
+                disabled={loading}
+                style={{
+                  padding: "13px 30px",
+                  background: loading ? "#5a3a2a" : "#c70505",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 10,
+                  cursor: loading ? "not-allowed" : "pointer",
+                  fontSize: 15,
+                  fontWeight: 700,
+                  transition: "background 0.2s, box-shadow 0.2s",
+                }}
+              >
+                {loading
+                  ? "Generating…"
+                  : mode === "code"
+                    ? "Generate code →"
+                    : "Write lyrics →"}
+              </button>
+            </div>
           </div>
         </div>
       </div>

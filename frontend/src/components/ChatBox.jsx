@@ -1,12 +1,7 @@
 import { useState, useRef } from "react";
 import { theme } from "../theme";
 import { inputAreaContainer, inputAreaTextarea } from "../styles/inputArea";
-
-const MODELS = [
-  { id: "claude-haiku", label: "Claude Haiku" },
-  { id: "qwen-3.5",     label: "Qwen 3.5 (Local)" },
-  { id: "gemini",       label: "Gemini 3.1 Flash Lite" },
-];
+import { MODELS } from "../models";
 
 const styles = {
   container: { ...inputAreaContainer },
@@ -95,8 +90,10 @@ function readFileAsBase64(file) {
 export default function ChatBox({ onSend, onNewChat, loading }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]);
-  const [selectedModel, setSelectedModel] = useState("claude-haiku");
+  const [selectedModel, setSelectedModel] = useState("gemini");
   const fileInputRef = useRef(null);
+
+  const isLocalModel = MODELS.find(m => m.id === selectedModel)?.isLocal ?? false;
 
   const handleSend = () => {
     const text = input.trim();
@@ -190,11 +187,11 @@ export default function ChatBox({ onSend, onNewChat, loading }) {
           <button
             style={{
               ...styles.secondaryBtn,
-              ...(selectedModel === "qwen-3.5" || selectedModel === "gemini" ? styles.secondaryBtnDisabled : {}),
+              ...(isLocalModel ? styles.secondaryBtnDisabled : {}),
             }}
             onClick={() => fileInputRef.current?.click()}
-            disabled={selectedModel === "qwen-3.5" || selectedModel === "gemini"}
-            title={selectedModel === "qwen-3.5" || selectedModel === "gemini" ? "Attachments not supported for this model" : "Attach PDF, image, or text file"}
+            disabled={isLocalModel}
+            title={isLocalModel ? "Attachments not supported for local models" : "Attach PDF, image, or text file"}
           >
             ⊕ Attach
           </button>
@@ -206,8 +203,9 @@ export default function ChatBox({ onSend, onNewChat, loading }) {
             style={styles.modelSelect}
             value={selectedModel}
             onChange={(e) => {
+              const m = MODELS.find(o => o.id === e.target.value);
               setSelectedModel(e.target.value);
-              if (e.target.value === "qwen-3.5" || e.target.value === "gemini") setAttachments([]);
+              if (m?.isLocal) setAttachments([]);
             }}
           >
             {MODELS.map((m) => (

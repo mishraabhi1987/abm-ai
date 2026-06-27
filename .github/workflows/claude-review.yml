@@ -46,6 +46,11 @@ jobs:
           # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # --- Gemini key (active). Create this secret in repo Settings. ---
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # CI runs in a fresh checkout that Gemini CLI treats as "untrusted"
+          # by default (safety guard against malicious repos auto-running tools).
+          # A CI runner is an isolated, trusted environment, so we opt in here.
+          # Without this the review step fails with exit code 55.
+          GEMINI_CLI_TRUST_WORKSPACE: "true"
         run: |
           # Generate diff against the base branch
           git diff origin/${{ github.base_ref }}...HEAD > pr.diff

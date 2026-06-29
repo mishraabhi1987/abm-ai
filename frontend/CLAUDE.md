@@ -12,7 +12,7 @@ npm run build    # outputs to frontend/dist
 npm run lint
 ```
 
-The dev server proxies `/chat` and `/new` to `http://localhost:8000` (the FastAPI backend must be running separately). `generateLyrics` in `api/chat.js` hits `http://localhost:8000/api/lyrics` directly via a hardcoded `LYRICS_API_BASE` — the Vite proxy does not cover `/api/lyrics`.
+The dev server proxies `/chat`, `/new`, and `/api/agent` to the FastAPI backends (both must be running separately). `generateLyrics` in `api/chat.js` hits `http://localhost:8000/api/lyrics` directly via a hardcoded `LYRICS_API_BASE` — the Vite proxy does not cover `/api/lyrics`.
 
 ## Stack
 
@@ -42,17 +42,28 @@ The page is a fixed-height flex column (`100vh`, no page scroll). Three zones:
 2. **Middle** (`flex: 1, minHeight: 0`) — the only scrollable region (`overflowY: auto`). Holds the message feed. `minHeight: 0` on both the flex parent and scroll child is required — removing it breaks overflow.
 3. **Bottom** (`flexShrink: 0`) — `<ChatBox />`. Pinned, never scrolls.
 
-When the Artifacts tab is active, the middle+bottom zone is replaced wholesale by `<Artifacts />`, which replicates the same flex column structure internally.
+When the Artifacts tab is active, the middle+bottom zone is replaced wholesale by `<Artifacts />`. When the Agents tab is active it is replaced by `<Agents />`. Both components replicate the same flex column structure internally.
 
 ## Tab bar & routing (`TabBar.jsx`, `App.jsx`)
 
-Tabs are defined in the `TABS` array in `TabBar.jsx`:
+Tabs are defined as an object array in `TabBar.jsx`:
 
 ```js
-const TABS = ["Chat Bot", "Artifacts", "Agents", "Career", "News / Social"];
+const TABS = [
+  { id: "chat",      label: "Chat Bot"      },
+  { id: "artifacts", label: "Artifacts"     },
+  { id: "agents",    label: "Agents"        },
+  { id: "career",    label: "Career"        },
+  { id: "news",      label: "News / Social" },
+];
 ```
 
-`App.jsx` compares `activeTab` against the string `"Artifacts"` (via the `ARTIFACTS_TAB` constant). Only `Chat Bot` and `Artifacts` have distinct views — clicking `Agents`, `Career`, or `News / Social` highlights the tab but falls through to the Chat pane. These tabs are not wired.
+`App.jsx` matches `activeTab` (a string id) against the `ARTIFACTS_TAB = "artifacts"` and `AGENTS_TAB = "agents"` constants. Wired tabs:
+- `"chat"` → Chat Bot pane (default)
+- `"artifacts"` → `<Artifacts />`
+- `"agents"` → `<Agents />`
+
+`"career"` and `"news"` highlight the tab but fall through to the Chat pane — not yet wired.
 
 Active tab styling: `theme.accentDeep` background pill. Tab font: Sora 600.
 
@@ -62,7 +73,7 @@ Internal sub-mode toggle: `"code"` | `"lyrics"`. Both modes are fully functional
 
 **Code mode** — maintains its own `artifactsSessionId` state for multi-turn refinement. Each generate call passes this session ID to `sendMessage` and updates it from the response. `CODE_INSTRUCTION` instructs the model to modify existing code incrementally (not rebuild) and default to a dark background. Mode switches via `switchMode()` which resets `artifactsSessionId`, `output`, and `error` — intentional so Code and Lyrics contexts don't bleed across switches. `extractCode` strips markdown fences if present; the cleaned HTML is passed to `<CodeArtifact />` for live iframe preview.
 
-**Lyrics mode** — always stateless and one-shot. Calls `generateLyrics(prompt)` directly (no session ID). Output shown in `<CopyBlock />`. Do NOT add session memory to lyrics generation.
+**Lyrics mode** — uses `sendMessage` with its own `lyricsSessionId` state, so lyrics within a session are multi-turn (the model sees prior output). Output shown in `<CopyBlock />`. The `lyricsSessionId` is reset by `switchMode()` just like `artifactsSessionId`. Do NOT call `generateLyrics` from `Artifacts.jsx` — that function hits the separate `/api/lyrics` endpoint which is no longer used by this tab.
 
 **`switchMode(next)`** is the only correct way to change mode — do not call `setMode` directly, as it would skip the session and output resets.
 
@@ -74,14 +85,35 @@ Internal sub-mode toggle: `"code"` | `"lyrics"`. Both modes are fully functional
 - `ChartWidget.jsx` requires all Chart.js primitives to be registered at module load — do not remove the `ChartJS.register(...)` call.
 - File on disk is `Copyblock.jsx` (lowercase b) but imported everywhere as `CopyBlock`. Match the import casing, not the filename, when referencing it.
 
-## API layer (`src/api/chat.js`)
+## API layer (`src/api/`)
 
-`sessionId` is held in module-level scope for the main chat tab. Callers that manage their own session (e.g. Artifacts) pass it explicitly via the options argument. Three exports:
+### `chat.js`
 
-- `sendMessage(message, mode?, { sessionId?, attachments? }?)` — POST `/chat`. Returns `{ answer, chartData, sessionId }`. If `sessionId` is passed in options, the module-level session is not updated (caller owns that session). Attachments are `[{ filename, media_type, data_base64 }]`.
+`sessionId` is held in module-level scope for the main chat tab. Callers that manage their own session (e.g. Artifacts, Agents) pass it explicitly via the options argument. Three exports:
+
+- `sendMessage(message, mode?, { sessionId?, attachments?, model }?)` — POST `/chat`. Returns `{ answer, chartData, sessionId }`. If `sessionId` is passed in options, the module-level session is not updated (caller owns that session). `model` must always be passed explicitly — there is no default. Attachments are `[{ filename, media_type, data_base64 }]`.
 - `newChat()` — POST `/new`, nulls out the module-level `sessionId`.
-- `generateLyrics(prompt)` — POST `http://localhost:8000/api/lyrics`, returns `{ lyrics }`. Always stateless — no session ID.
+- `generateLyrics(prompt)` — POST `http://localhost:8000/api/lyrics`, returns `{ lyrics }`. Stateless — no session ID. No longer called by `Artifacts.jsx`; kept for direct use only.
+
+### `agents.js`
+
+Single export:
+
+- `runFinanceAgent(query)` — POST `/api/agent/finance` (proxied to port 8001). Returns `{ price, news, analysis, query }`. Stateless — no session ID.
 
 ## ChatBox (`src/components/ChatBox.jsx`)
 
-`onSend(text, attachments)` — both arguments are now required by callers. `attachments` is an array of `{ filename, media_type, data_base64 }` objects (empty array when no files attached). A hidden `<input type="file">` (PDF, images, `.txt`, `.md`) feeds an `attachments` state; selected files are read to base64 via `FileReader`. File chips (filename + × remove button) render above the textarea when files are present. The `⊕ Attach` button uses the same `secondaryBtn` style as `+ New Chat`. Clear attachments after send — already done in `handleSend`.
+`onSend(text, attachments, model)` — all three arguments are required by callers. `attachments` is an array of `{ filename, media_type, data_base64 }` objects (empty array when no files attached). `model` is the currently selected model id string.
+
+Internal state: `selectedModel` (default `"gemini"`), `attachments`, `input`. A hidden `<input type="file">` (PDF, images, `.txt`, `.md`) feeds the `attachments` state; selected files are read to base64 via `FileReader`. File chips (filename + × remove button) render above the textarea when files are present. The `⊕ Attach` button is disabled when `isLocal` is true for the selected model; switching to a local model also clears pending attachments. The `⊕ Attach` button uses the same `secondaryBtn` style as `+ New Chat`. Clear attachments after send — already done in `handleSend`.
+
+## Agents panel (`Agents.jsx`)
+
+Renders the Finance Agent UI. Internal state: `mode` (currently only `"Finance Agent"`), `prompt`, `result`, `error`, `loading`.
+
+`handleRun` calls `runFinanceAgent(query)` from `api/agents.js` and stores the structured response in `result`. The response shape is `{ price, news, analysis, query }`:
+- **price hero** — ticker chip, exchange badge, current price, day change pill, metrics row (prev close, change, change %)
+- **news** — list of `{ title, url, source, date, summary }` cards with hover lift effect
+- **analysis** — Claude-generated markdown rendered via `marked.parse()` with the `mdStyles` from `Bubble.jsx`
+
+`exchangeLabel(symbol)` derives the exchange from the ticker suffix (`.NS` → NSE, `.BO` → BSE, else NYSE/NASDAQ). The mode dropdown (`MODES = ["Finance Agent"]`) is wired to `switchMode` for future expansion.

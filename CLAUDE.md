@@ -92,6 +92,8 @@ The `ChatRequest.model` field is `Literal["claude-haiku", "qwen-3.5", "gemini"]`
 
 **Artifacts tab** — has its own `selectedModel` state (default `"gemini"`) independent of Chat Bot. Both Code and Lyrics generation pass `model: selectedModel` to `sendMessage`. Changing the model resets `artifactsSessionId` so Code mode starts a clean session. Lyrics uses `LYRICS_INSTRUCTION` prepended to the prompt — no MCP resource/prompt context (unlike the `/api/lyrics` endpoint). The Artifacts tab maintains two isolated sessions — `artifactsSessionId` (Code) and `lyricsSessionId` (Lyrics) — so neither contaminates the Chat Bot's module-level `sessionId`.
 
+**Agents tab** — renders `<Agents />` (Finance Agent UI). Calls `POST /api/agent/finance` (proxied to `agent_server.py` on port 8001) via `frontend/src/api/agents.js:runFinanceAgent`. Stateless — no session ID. Returns structured `{ price, news, analysis, query }` which the component renders as a price hero card, news cards, and a markdown analysis block. Adding new agent modes: add to the `MODES` array in `Agents.jsx` and branch in `handleRun`.
+
 The Ollama and Gemini paths are **intentionally stateless** — no session history is stored or retrieved. Do NOT add memory to `run_ollama` or `run_gemini`. `think: False` is set on the Ollama request to suppress chain-of-thought output.
 
 ## Skills (`.claude/skills/`)

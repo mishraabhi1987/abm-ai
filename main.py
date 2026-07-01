@@ -2,6 +2,7 @@ import sys
 import os
 import uuid
 import json
+import logging
 import asyncio
 import base64
 import httpx
@@ -18,9 +19,10 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.stdio import stdio_client
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+from tool_registry import ToolRegistry
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 anthropic = AsyncAnthropic()
 app = FastAPI()
 
@@ -37,18 +39,18 @@ server_params = StdioServerParameters(
     env=os.environ,
 )
 
-# LiteLLM MCP server config
 LITELLM_URL = "https://litellm.tfscreener.com/mcp/"
 LITELLM_HEADERS = {
     "Authorization": f"Bearer {os.getenv('LITELLM_API_KEY')}",
 }
-LOCAL_PRIORITY = True  # local tool wins on name collision with LiteLLM
-ATTACH_LIMIT_BYTES = 15 * 1024 * 1024  # 15 MB decoded attachment ceiling
+LOCAL_PRIORITY = True
+ATTACH_LIMIT_BYTES = 15 * 1024 * 1024
+MAX_TURNS = 6  # hard cap on tool-call iterations per request
 
 now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
 SYSTEM_PROMPT = (
-"You are ABM AI, created by Abhishek (ABM Technologies). "
+    "You are ABM AI, created by Abhishek (ABM Technologies). "
     f"The current date and time is {now.strftime('%A, %B %d, %Y, %I:%M %p')} IST. "
     "Use this as the single anchor for every date, weekday, age, duration, or 'current' "
     "calculation — compute from it, never from memory or assumption. "
@@ -69,11 +71,13 @@ SYSTEM_PROMPT = (
     "you MUST copy that entire line including CHART_DATA:: and everything after it verbatim into your response."
 )
 
+
 class SessionStore:
     """In-memory session store with per-session message cap.
     TODO: replace _store with an aiosqlite backend for persistence across restarts.
     Interface contract: callers use only get / set / reset.
     """
+
     MAX_MESSAGES = 200
 
     def __init__(self):
@@ -106,76 +110,84 @@ class ChatRequest(BaseModel):
     model: Literal["claude-haiku", "qwen-3.5", "gemini"] = "claude-haiku"
 
 
-async def run_agent(messages: list, mode: str = "auto") -> dict:
+def _extract_chart(text: str) -> dict:
+    """Split CHART_DATA:: marker from text and brace-count-parse the JSON payload."""
+    if "CHART_DATA::" not in text:
+        return {"text": text, "chart_data": None}
+    parts = text.split("CHART_DATA::")
+    text_part = parts[0].replace("Render this chart in the UI:", "").strip()
+    raw = parts[1].strip() if len(parts) > 1 else ""
+    brace_count = 0
+    json_end = 0
+    for i, ch in enumerate(raw):
+        if ch == "{":
+            brace_count += 1
+        elif ch == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                json_end = i + 1
+                break
+    if json_end > 0:
+        try:
+            chart_part = json.loads(raw[:json_end])
+            if not text_part:
+                text_part = f"📊 {chart_part.get('title', 'Chart')}"
+            return {"text": text_part, "chart_data": chart_part}
+        except json.JSONDecodeError:
+            pass
+    return {
+        "text": text_part or text.replace("CHART_DATA::", "").strip(),
+        "chart_data": None,
+    }
+
+
+async def run_haiku(messages: list, registry: ToolRegistry, mode: str = "auto") -> dict:
+    """Claude Haiku agentic loop with local + optional LiteLLM tools via ToolRegistry."""
     async with AsyncExitStack() as stack:
-        # --- Local session (mandatory) ---
-        local_read, local_write = await stack.enter_async_context(
-            stdio_client(server_params)
-        )
-        local_session = await stack.enter_async_context(
-            ClientSession(local_read, local_write)
-        )
-        await local_session.initialize()
-        local_tools_resp = await local_session.list_tools()
-        local_tools = [
-            {
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.inputSchema,
-            }
-            for t in local_tools_resp.tools
-        ]
+        litellm_registry: ToolRegistry | None = None
+        litellm_tools_raw: list = []
 
-        # --- LiteLLM session (optional, 5 s timeout) ---
-        litellm_session = None
-        litellm_tools = []
-
-        async def _open_litellm(s: AsyncExitStack):
+        async def _open_litellm(s: AsyncExitStack) -> ToolRegistry:
             r, w, _ = await s.enter_async_context(
                 streamablehttp_client(LITELLM_URL, headers=LITELLM_HEADERS)
             )
             ls = await s.enter_async_context(ClientSession(r, w))
             await ls.initialize()
-            resp = await ls.list_tools()
-            return ls, [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.inputSchema,
-                }
-                for t in resp.tools
-            ]
+            return ToolRegistry(ls)
 
         _litellm_stack = AsyncExitStack()
         try:
-            litellm_session, litellm_tools = await asyncio.wait_for(
-                _open_litellm(_litellm_stack), timeout=5.0
-            )
+            lr = await asyncio.wait_for(_open_litellm(_litellm_stack), timeout=5.0)
             await stack.enter_async_context(_litellm_stack)
+            litellm_registry = lr
+            litellm_tools_raw = await litellm_registry.get_tools("anthropic")
         except Exception as e:
             await _litellm_stack.aclose()
-            print(f"Warning: LiteLLM unavailable ({type(e).__name__}), using local tools only.")
+            print(
+                f"Warning: LiteLLM unavailable ({type(e).__name__}), using local tools only."
+            )
 
-        # --- Routing map: tool_name -> session (LOCAL_PRIORITY: local wins on collision) ---
-        tool_routing: dict = {}
-        for t in litellm_tools:
-            tool_routing[t["name"]] = litellm_session
+        local_tools_raw = await registry.get_tools("anthropic")
+
+        # tool_name → ToolRegistry (local wins on name collision)
+        tool_routing: dict[str, ToolRegistry] = {}
+        for t in litellm_tools_raw:
+            tool_routing[t["name"]] = litellm_registry  # type: ignore[assignment]
         if LOCAL_PRIORITY:
-            for t in local_tools:
-                tool_routing[t["name"]] = local_session
+            for t in local_tools_raw:
+                tool_routing[t["name"]] = registry
 
-        # --- Deduplicate tools sent to Claude (local wins on collision) ---
-        seen_names: set = set()
-        all_tools = []
-        for t in local_tools + litellm_tools:
-            if t["name"] not in seen_names:
-                seen_names.add(t["name"])
+        # Deduplicate tool list sent to Claude (local wins)
+        seen: set[str] = set()
+        all_tools: list = []
+        for t in local_tools_raw + litellm_tools_raw:
+            if t["name"] not in seen:
+                seen.add(t["name"])
                 all_tools.append(t)
 
-        # --- mode / tool_choice setup ---
         if mode == "auto":
             active_tools = all_tools
-            tool_choice = {"type": "auto"}
+            tool_choice: dict = {"type": "auto"}
         else:
             active_tools = [t for t in all_tools if t["name"] == mode]
             if not active_tools:
@@ -184,8 +196,7 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
             else:
                 tool_choice = {"type": "tool", "name": mode}
 
-        # --- Agentic loop ---
-        while True:
+        for _turn in range(MAX_TURNS):
             response = await anthropic.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=5000,
@@ -197,152 +208,188 @@ async def run_agent(messages: list, mode: str = "auto") -> dict:
             messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use":
-                final = ""
-                for block in response.content:
-                    if block.type == "text":
-                        final += block.text
+                final = "".join(b.text for b in response.content if b.type == "text")
+                return _extract_chart(final)
 
-                if "CHART_DATA::" in final:
-                    parts = final.split("CHART_DATA::")
-                    text_part = parts[0].replace("Render this chart in the UI:", "").strip()
-                    raw = parts[1].strip() if len(parts) > 1 else ""
-
-                    # find the balanced {...} JSON block after the marker
-                    brace_count = 0
-                    json_end = 0
-                    for i, ch in enumerate(raw):
-                        if ch == "{":
-                            brace_count += 1
-                        elif ch == "}":
-                            brace_count -= 1
-                            if brace_count == 0:
-                                json_end = i + 1
-                                break
-
-                    # GUARD: only parse if we actually found a complete JSON block
-                    chart_part = None
-                    if json_end > 0:
-                        try:
-                            chart_part = json.loads(raw[:json_end])
-                        except json.JSONDecodeError:
-                            chart_part = None  # malformed/truncated -> show text only
-
-                    if chart_part is not None:
-                        if not text_part:
-                            text_part = f"📊 {chart_part.get('title', 'Chart')}"
-                        return {"text": text_part, "chart_data": chart_part}
-
-                    # chart missing/broken -> graceful text, NEVER a 500
-                    fallback = text_part or final.replace("CHART_DATA::", "").strip()
-                    return {"text": fallback, "chart_data": None}
-
-                return {"text": final, "chart_data": None}
-
-            # --- TOOL EXECUTION with ROUTING ---
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    session = tool_routing.get(block.name)
-                    result = await session.call_tool(block.name, block.input) if session else None
+                    r = tool_routing.get(block.name, registry)
+                    try:
+                        result_text = await r.execute(block.name, block.input)
+                    except RuntimeError as e:
+                        result_text = str(e)
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": [{"type": "text", "text": result_text}],
+                        }
+                    )
 
-                    # --- Parse MCP content to match Anthropic strict schema ---
-                    formatted_content = []
-                    if result and hasattr(result, "content") and result.content:
-                        for item in result.content:
-                            if item.type == "text":
-                                formatted_content.append({
-                                    "type": "text",
-                                    "text": item.text
-                                })
-                            elif item.type == "image":
-                                # Anthropic expects 'source' wrapper and 'media_type' instead of 'mimeType'
-                                formatted_content.append({
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": getattr(item, "mimeType", "image/jpeg"),
-                                        "data": item.data
-                                    }
-                                })
-                            else:
-                                # Fallback for any unknown types
-                                formatted_content.append({
-                                    "type": "text",
-                                    "text": str(item)
-                                })
-                    else:
-                        formatted_content = "Tool not found or returned empty result"
+            if not tool_results:
+                salvage = "".join(b.text for b in response.content if b.type == "text")
+                return {"text": salvage or "No response generated.", "chart_data": None}
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": formatted_content,
-                    })
-            if not tool_results: 
-                salvage = ""
-                for b in response.content:
-                    if b.type == "text":
-                        salvage += b.text
-                return {"text": salvage or "Sorry, I couldn't generate a response. Please try again.", "chart_data": None}
             messages.append({"role": "user", "content": tool_results})
             tool_choice = {"type": "auto"}
+
+    return {
+        "text": "Reached reasoning limit — please rephrase or break the question into smaller parts.",
+        "chart_data": None,
+    }
 
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
 
-async def run_gemini(message: str) -> dict:
+async def run_gemini_agent(message: str, registry: ToolRegistry) -> dict:
+    """Gemini tool-calling loop using ToolRegistry for tool dispatch."""
     if not GOOGLE_API_KEY:
-        return {"text": "Gemini unavailable — set GOOGLE_API_KEY in .env.", "chart_data": None}
+        return {
+            "text": "Gemini unavailable — set GOOGLE_API_KEY in .env.",
+            "chart_data": None,
+        }
+    tools = await registry.get_tools("gemini")
+    messages = [{"role": "user", "parts": [{"text": message}]}]
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                GEMINI_URL,
-                params={"key": GOOGLE_API_KEY},
-                json={"contents": [{"parts": [{"text": message}]}]},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            text = (
-                data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text")
-                or "Gemini returned an empty response."
-            )
-            return {"text": text, "chart_data": None}
+            for _turn in range(MAX_TURNS):
+                payload: dict = {"contents": messages}
+                if tools:
+                    payload["tools"] = tools
+                resp = await client.post(
+                    GEMINI_URL,
+                    params={"key": GOOGLE_API_KEY},
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                candidate = data.get("candidates", [{}])[0]
+                content = candidate.get("content", {})
+                parts = content.get("parts", [{}])
+                # Append model turn before executing tools (correct loop ordering)
+                messages.append({"role": "model", "parts": parts})
+                function_calls = [p for p in parts if "functionCall" in p]
+                if not function_calls:
+                    text = next((p.get("text") for p in parts if "text" in p), None)
+                    return {
+                        "text": text or "Gemini returned an empty response.",
+                        "chart_data": None,
+                    }
+                tool_results = []
+                for fc_part in function_calls:
+                    fc = fc_part["functionCall"]
+                    name = fc["name"]
+                    args = fc.get("args", {})
+                    try:
+                        result = await registry.execute(name, args)
+                    except RuntimeError as e:
+                        result = str(e)
+                    tool_results.append(
+                        {
+                            "functionResponse": {
+                                "name": name,
+                                "response": {"output": result},
+                            }
+                        }
+                    )
+                messages.append({"role": "user", "parts": tool_results})
     except httpx.HTTPStatusError as e:
-        return {"text": f"Gemini API error ({e.response.status_code}): {e.response.text}", "chart_data": None}
+        return {
+            "text": f"Gemini API error ({e.response.status_code}): {e.response.text}",
+            "chart_data": None,
+        }
     except httpx.TimeoutException:
         return {"text": "Gemini request timed out — try again.", "chart_data": None}
     except Exception as e:
         return {"text": f"Gemini error ({type(e).__name__}): {e}", "chart_data": None}
+    return {
+        "text": "Reached reasoning limit — please rephrase or break the question into smaller parts.",
+        "chart_data": None,
+    }
 
 
-async def run_ollama(message: str) -> dict:
+async def run_qwen_agent(message: str, registry: ToolRegistry) -> dict:
+    """Qwen/Ollama tool-calling loop using ToolRegistry for tool dispatch."""
+    tools = await registry.get_tools("openai")
+    messages: list = [{"role": "user", "content": message}]
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "http://localhost:11434/api/chat",
-                json={
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for _turn in range(MAX_TURNS):
+                payload: dict = {
                     "model": "qwen3.5:4b",
-                    "messages": [{"role": "user", "content": message}],
+                    "messages": messages,
                     "think": False,
                     "stream": False,
                     "options": {"num_ctx": 4096},
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            text = data.get("message", {}).get("content") or "Ollama returned an empty response."
-            return {"text": text, "chart_data": None}
+                }
+                if tools:
+                    payload["tools"] = tools
+                resp = await client.post(
+                    "http://localhost:11434/api/chat", json=payload
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                msg = data.get("message", {})
+                tool_calls = msg.get("tool_calls") or []
+                # Append assistant turn before executing tools (correct loop ordering)
+                assistant_msg: dict = {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                }
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                messages.append(assistant_msg)
+                if not tool_calls:
+                    return {
+                        "text": msg.get("content")
+                        or "Ollama returned an empty response.",
+                        "chart_data": None,
+                    }
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "run_qwen_agent: failed to parse tool arguments as JSON "
+                                "(tool=%r, raw=%r) — falling back to empty dict",
+                                name,
+                                args,
+                            )
+                            args = {}
+                    try:
+                        result = await registry.execute(name, args)
+                    except RuntimeError as e:
+                        result = str(e)
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", name),
+                            "content": result,
+                        }
+                    )
     except httpx.ConnectError:
-        return {"text": "Local model offline — start `ollama serve`.", "chart_data": None}
+        return {
+            "text": "Local model offline — start `ollama serve`.",
+            "chart_data": None,
+        }
     except httpx.TimeoutException:
-        return {"text": "Ollama request timed out — the model may still be loading, try again.", "chart_data": None}
+        return {
+            "text": "Ollama request timed out — the model may still be loading, try again.",
+            "chart_data": None,
+        }
     except Exception as e:
         return {"text": f"Ollama error ({type(e).__name__}): {e}", "chart_data": None}
+    return {
+        "text": "Reached reasoning limit — please rephrase or break the question into smaller parts.",
+        "chart_data": None,
+    }
 
 
 @app.get("/")
@@ -359,42 +406,61 @@ async def styles():
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
 
-    # Validate total attachment size
     if req.attachments:
         total = sum(len(a.data_base64) * 3 // 4 for a in req.attachments)
         if total > ATTACH_LIMIT_BYTES:
-            raise HTTPException(status_code=413, detail="Attachments exceed 15 MB limit")
+            raise HTTPException(
+                status_code=413, detail="Attachments exceed 15 MB limit"
+            )
 
-    # Build content blocks for the user turn
     content: list = []
     if req.message:
         content.append({"type": "text", "text": req.message})
-    for a in (req.attachments or []):
+    for a in req.attachments or []:
         if a.media_type == "application/pdf":
-            content.append({
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": a.data_base64},
-            })
+            content.append(
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": a.data_base64,
+                    },
+                }
+            )
         elif a.media_type.startswith("image/"):
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": a.media_type, "data": a.data_base64},
-            })
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": a.media_type,
+                        "data": a.data_base64,
+                    },
+                }
+            )
         elif a.media_type in ("text/plain", "text/markdown"):
-            text = base64.b64decode(a.data_base64).decode("utf-8", errors="replace")[:4000]
+            text = base64.b64decode(a.data_base64).decode("utf-8", errors="replace")[
+                :4000
+            ]
             content.append({"type": "text", "text": f"[{a.filename}]\n{text}"})
     if not content:
         content = [{"type": "text", "text": ""}]
 
-    if req.model == "qwen-3.5":
-        result = await run_ollama(req.message)
-    elif req.model == "gemini":
-        result = await run_gemini(req.message)
-    else:
-        history = session_store.get(session_id)
-        history.append({"role": "user", "content": content})
-        result = await run_agent(history, req.mode)
-        session_store.set(session_id, history)
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            registry = ToolRegistry(session)
+
+            if req.model == "qwen-3.5":
+                result = await run_qwen_agent(req.message, registry)
+            elif req.model == "gemini":
+                result = await run_gemini_agent(req.message, registry)
+            else:
+                history = session_store.get(session_id)
+                history.append({"role": "user", "content": content})
+                result = await run_haiku(history, registry, req.mode)
+                session_store.set(session_id, history)
 
     return {
         "answer": result["text"],
@@ -409,16 +475,6 @@ async def new_chat(req: ChatRequest):
         session_store.reset(req.session_id)
     return {"ok": True}
 
-# ============================================================
-#  ADD THIS to main.py  (Lyrics endpoint for Artifacts -> Lyrics mode)
-#  Uses the LOCAL MCP server's prompt + resource that you added to server.py:
-#    resource: lyrics://standards
-#    prompt:   lyrics_brief
-#  NOTE: read_resource / get_prompt return-shapes vary slightly by SDK version.
-#  On first run, print(res) and print(pr) once and adjust .contents / .messages
-#  if the fields differ — do not assume in the dark.
-# ============================================================
-
 
 class LyricsRequest(BaseModel):
     mood: str
@@ -427,16 +483,13 @@ class LyricsRequest(BaseModel):
 
 
 async def run_lyrics(mood: str, theme: str = "", anchor: str = "") -> str:
-    # Only the LOCAL stdio server is needed (it holds the lyrics primitives).
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # 1. RESOURCE  (App-controlled standards)
             res = await session.read_resource("lyrics://standards")
             standards = res.contents[0].text
 
-            # 2. PROMPT  (User-controlled brief)
             args = {"mood": mood}
             if theme:
                 args["theme"] = theme
@@ -445,7 +498,6 @@ async def run_lyrics(mood: str, theme: str = "", anchor: str = "") -> str:
             pr = await session.get_prompt("lyrics_brief", arguments=args)
             brief = pr.messages[0].content.text
 
-            # 3. Standards as system, brief as the user turn -> Claude writes the lyrics.
             response = await anthropic.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=5000,
